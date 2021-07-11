@@ -1,6 +1,8 @@
 # View的draw
 
-![image-20210711201010140](image-20210711201010140.png)
+![image-20210712014058407](image-20210712014058407.png)
+
+
 
 ## ViewRootImpl
 
@@ -1226,6 +1228,613 @@
 # ------------
 
 # 硬件绘制
+
+## -----------------------------
+
+## 硬件绘制前的初始化阶段
+
+## ViewRootImpl
+
+### `setView()`
+
+```java
+public void setView(View view, WindowManager.LayoutParams attrs, View panelParentView,
+            int userId) {
+        synchronized (this) {
+            if (mView == null) {
+                mView = view;
+
+                ......
+
+                if (view instanceof RootViewSurfaceTaker) {
+                    mSurfaceHolderCallback =
+                            ((RootViewSurfaceTaker)view).willYouTakeTheSurface();
+                    if (mSurfaceHolderCallback != null) {
+                        mSurfaceHolder = new TakenSurfaceHolder();
+                        mSurfaceHolder.setFormat(PixelFormat.UNKNOWN);
+                        mSurfaceHolder.addCallback(mSurfaceHolderCallback);
+                    }
+                }
+			   .....	
+
+                // If the application owns the surface, don't enable hardware acceleration
+                if (mSurfaceHolder == null) {
+                    // While this is supposed to enable only, it can effectively disable
+                    // the acceleration too.
+                    enableHardwareAcceleration(attrs);
+                    final boolean useMTRenderer = MT_RENDERER_AVAILABLE
+                            && mAttachInfo.mThreadedRenderer != null;
+                    if (mUseMTRenderer != useMTRenderer) {
+                        // Shouldn't be resizing, as it's done only in window setup,
+                        // but end just in case.
+                        endDragResizing();
+                        mUseMTRenderer = useMTRenderer;
+                    }
+                }
+			   ......	
+            }
+        }
+    }
+```
+
+
+
+### `enableHardwareAcceleration()`
+
+
+
+```java
+    private void enableHardwareAcceleration(WindowManager.LayoutParams attrs) {
+        // 先把硬件加速 相关属性置为false
+        mAttachInfo.mHardwareAccelerated = false;
+        mAttachInfo.mHardwareAccelerationRequested = false;
+
+        // 当应用程序处于兼容模式时不要启用硬件加速 
+        if (mTranslator != null) return;
+
+        // 判断当前 window 是否打开硬件加速
+        final boolean hardwareAccelerated =
+                (attrs.flags & WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED) != 0;
+
+        if (hardwareAccelerated) {
+            // 目前R版本上默认view层级支持硬件渲染
+            if (!ThreadedRenderer.isAvailable()) {
+                return;
+            }
+
+            final boolean fakeHwAccelerated = (attrs.privateFlags &
+                    WindowManager.LayoutParams.PRIVATE_FLAG_FAKE_HARDWARE_ACCELERATED) != 0;
+            final boolean forceHwAccelerated = (attrs.privateFlags &
+                    WindowManager.LayoutParams.PRIVATE_FLAG_FORCE_HARDWARE_ACCELERATED) != 0;
+
+            if (fakeHwAccelerated) {
+                // This is exclusively for the preview windows the window manager
+                // shows for launching applications, so they will look more like
+                // the app being launched.
+                mAttachInfo.mHardwareAccelerationRequested = true;
+            } else if (!ThreadedRenderer.sRendererDisabled 
+                    || (ThreadedRenderer.sSystemRendererDisabled && forceHwAccelerated)) {
+                if (mAttachInfo.mThreadedRenderer != null) {
+                    mAttachInfo.mThreadedRenderer.destroy();
+                }
+
+                ......
+				
+                // 创建 ThreadedRenderer
+                mAttachInfo.mThreadedRenderer = ThreadedRenderer.create(mContext, translucent,
+                        attrs.getTitle().toString());
+                mAttachInfo.mThreadedRenderer.setWideGamut(wideGamut);
+                updateForceDarkMode();
+                if (mAttachInfo.mThreadedRenderer != null) {
+                    mAttachInfo.mHardwareAccelerated =
+                            mAttachInfo.mHardwareAccelerationRequested = true;
+                }
+            }
+        }
+    }
+
+```
+
+
+
+## ThreadedRenderer
+
+ThreadedRenderer 继承了 HardwareRenderer， create实际上会调用 HardwareRenderer 的构造方法
+
+* `nCreateRootRenderNode ()` 创建native层的 RootRenderNode ，也就是所有 RenderNode 的根
+* `RenderNode.adopt()` 根据native层的 RootRenderNode 创建 java层的 RootRenderNode
+* `nCreateProxy()` 创建RenderNode的代理者
+* ProcessInitializer的初始化graphicsstats服务
+
+### `create()`
+
+```java
+public final class ThreadedRenderer extends HardwareRenderer {
+    ......
+	public static ThreadedRenderer create(Context context, boolean translucent, String name) {
+        ThreadedRenderer renderer = null;
+        if (isAvailable()) { // R版本上默认为true
+            renderer = new ThreadedRenderer(context, translucent, name);
+        }
+        return renderer;
+    }
+
+	ThreadedRenderer(Context context, boolean translucent, String name) {
+        super();
+        setName(name);
+        setOpaque(!translucent);
+
+        final TypedArray a = context.obtainStyledAttributes(null, R.styleable.Lighting, 0, 0);
+        mLightY = a.getDimension(R.styleable.Lighting_lightY, 0);
+        mLightZ = a.getDimension(R.styleable.Lighting_lightZ, 0);
+        mLightRadius = a.getDimension(R.styleable.Lighting_lightRadius, 0);
+        float ambientShadowAlpha = a.getFloat(R.styleable.Lighting_ambientShadowAlpha, 0);
+        float spotShadowAlpha = a.getFloat(R.styleable.Lighting_spotShadowAlpha, 0);
+        a.recycle();
+        setLightSourceAlpha(ambientShadowAlpha, spotShadowAlpha);
+    }
+    ......
+}
+
+public class HardwareRenderer {
+	public HardwareRenderer() {
+        // 创建native层的 RootRenderNode ，也就是所有 RenderNode 的根
+        // 根据native层的 RootRenderNode 创建 java层的 RootRenderNode
+        mRootNode = RenderNode.adopt(nCreateRootRenderNode());
+        mRootNode.setClipToBounds(false);
+        // 创建RenderNode的代理者
+        mNativeProxy = nCreateProxy(!mOpaque, mIsWideGamut, mRootNode.mNativeRenderNode);
+        if (mNativeProxy == 0) {
+            throw new OutOfMemoryError("Unable to create hardware renderer");
+        }
+        Cleaner.create(this, new DestroyContextRunnable(mNativeProxy));
+        // 初始化graphicsstats服务
+        ProcessInitializer.sInstance.init(mNativeProxy);
+    }
+}
+```
+
+
+
+## ViewRootImpl
+
+### `performTraversals()`
+
+```java
+    private void performTraversals() {
+        
+        ......
+
+        /**
+         * 开始 measure
+         */
+        if (mFirst || windowShouldResize || viewVisibilityChanged || cutoutChanged || params != null
+                || mForceNextWindowRelayout) {
+            mForceNextWindowRelayout = false;
+
+            .....
+
+            if (mSurfaceHolder != null) {
+                mSurfaceHolder.mSurfaceLock.lock();
+                mDrawingAllowed = true;
+            }
+
+            boolean hwInitialized = false;
+            boolean dispatchApplyInsets = false;
+            boolean hadSurface = mSurface.isValid();
+
+            try {
+
+                if (mAttachInfo.mThreadedRenderer != null) {
+                    // relayoutWindow may decide to destroy mSurface. As that decision
+                    // happens in WindowManager service, we need to be defensive here
+                    // and stop using the surface in case it gets destroyed.
+                    if (mAttachInfo.mThreadedRenderer.pause()) {
+                        // Animations were running so we need to push a frame
+                        // to resume them
+                        mDirty.set(0, 0, mWidth, mHeight);
+                    }
+                    mChoreographer.mFrameInfo.addFlags(FrameInfo.FLAG_WINDOW_LAYOUT_CHANGED);
+                }
+                ......
+
+                cutoutChanged = !mPendingDisplayCutout.equals(mAttachInfo.mDisplayCutout);
+                surfaceSizeChanged = (relayoutResult
+                        & WindowManagerGlobal.RELAYOUT_RES_SURFACE_RESIZED) != 0;
+                final boolean alwaysConsumeSystemBarsChanged =
+                        mPendingAlwaysConsumeSystemBars != mAttachInfo.mAlwaysConsumeSystemBars;
+                final boolean colorModeChanged = hasColorModeChanged(lp.getColorMode());
+                surfaceCreated = !hadSurface && mSurface.isValid();
+                surfaceDestroyed = hadSurface && !mSurface.isValid();
+                surfaceReplaced = (surfaceGenerationId != mSurface.getGenerationId())
+                        && mSurface.isValid();
+			   ......
+
+                if (surfaceCreated) {
+                    // If we are creating a new surface, then we need to
+                    // completely redraw it.
+                    mFullRedrawNeeded = true;
+                    mPreviousTransparentRegion.setEmpty();
+
+                    if (mAttachInfo.mThreadedRenderer != null) {
+                        try {
+                            // 初始化 ThreadedRenderer 
+                            hwInitialized = mAttachInfo.mThreadedRenderer.initialize(mSurface);
+                            if (hwInitialized && (host.mPrivateFlags
+                                            & View.PFLAG_REQUEST_TRANSPARENT_REGIONS) == 0) {
+                                // Don't pre-allocate if transparent regions
+                                // are requested as they may not be needed
+                                mAttachInfo.mThreadedRenderer.allocateBuffers();
+                            }
+                        } catch (OutOfResourcesException e) {
+                            handleOutOfResourcesException(e);
+                            return;
+                        }
+                    }
+                    notifySurfaceCreated();
+                } else if (surfaceDestroyed) {
+                    // If the surface has been removed, then reset the scroll
+                    // positions.
+                    if (mLastScrolledFocus != null) {
+                        mLastScrolledFocus.clear();
+                    }
+                    mScrollY = mCurScrollY = 0;
+                    if (mView instanceof RootViewSurfaceTaker) {
+                        ((RootViewSurfaceTaker) mView).onRootViewScrollYChanged(mCurScrollY);
+                    }
+                    if (mScroller != null) {
+                        mScroller.abortAnimation();
+                    }
+                    // 销毁 ThreadedRenderer
+                    if (mAttachInfo.mThreadedRenderer != null &&
+                            mAttachInfo.mThreadedRenderer.isEnabled()) {
+                        mAttachInfo.mThreadedRenderer.destroy();
+                    }
+                } else if ((surfaceReplaced || surfaceSizeChanged || windowRelayoutWasForced || colorModeChanged)
+                        && mSurfaceHolder == null
+                        && mAttachInfo.mThreadedRenderer != null
+                        && mSurface.isValid()) {
+                    mFullRedrawNeeded = true;
+                    try {
+                        // 更新 Surface
+                        mAttachInfo.mThreadedRenderer.updateSurface(mSurface);
+                    } catch (OutOfResourcesException e) {
+                        handleOutOfResourcesException(e);
+                        return;
+                    }
+                }
+
+                if (!surfaceCreated && surfaceReplaced) {
+                    notifySurfaceReplaced();
+                }
+
+                
+            } catch (RemoteException e) {
+            }
+
+            ......
+
+            final ThreadedRenderer threadedRenderer = mAttachInfo.mThreadedRenderer;
+            if (threadedRenderer != null && threadedRenderer.isEnabled()) {
+                if (hwInitialized
+                        || mWidth != threadedRenderer.getWidth()
+                        || mHeight != threadedRenderer.getHeight()
+                        || mNeedsRendererSetup) {
+                    threadedRenderer.setup(mWidth, mHeight, mAttachInfo,
+                            mWindowAttributes.surfaceInsets);
+                    mNeedsRendererSetup = false;
+                }
+            }
+
+            ......
+            /**
+         	 * performMeasure()
+         	 */
+            ......
+            
+        } else {
+            // Not the first pass and no window/insets/visibility change but the window
+            // may have moved and we need check that and if so to update the left and right
+            // in the attach info. We translate only the window frame since on window move
+            // the window manager tells us only for the new frame but the insets are the
+            // same and we do not want to translate them more than once.
+            maybeHandleWindowMove(frame);
+        }
+
+        if (surfaceSizeChanged || surfaceReplaced || surfaceCreated || windowAttributesChanged) {
+            updateBoundsLayer();
+        }
+
+        /**
+         * 开始layout
+         */
+        ......
+
+        /**
+         * 开始 处理焦点
+         */
+        ......
+
+        /**
+         * 开始 draw
+         */
+        ......
+    }
+
+```
+
+
+
+## ThreadedRenderer
+
+初始化 ThreadedRenderer
+
+### `initialize()`
+
+```java
+public final class ThreadedRenderer extends HardwareRenderer {
+	boolean initialize(Surface surface) throws OutOfResourcesException {
+        boolean status = !mInitialized;
+        mInitialized = true;
+        updateEnabledState(surface);
+        setSurface(surface);
+        return status;
+    }
+
+	public void setSurface(Surface surface) {
+        // TODO: Do we ever pass a non-null but isValid() = false surface?
+        // This is here to be super conservative for ViewRootImpl
+        if (surface != null && surface.isValid()) {
+            super.setSurface(surface);
+        } else {
+            super.setSurface(null);
+        }
+    }
+}
+
+public class HardwareRenderer {
+	public void setSurface(@Nullable Surface surface, boolean discardBuffer) {
+        if (surface != null && !surface.isValid()) {
+            throw new IllegalArgumentException("Surface is invalid. surface.isValid() == false.");
+        }
+        // 
+        nSetSurface(mNativeProxy, surface, discardBuffer);
+    }
+}
+	
+```
+
+
+
+## ------------------------
+
+
+
+## 开始硬件绘制
+
+## ViewRootimpl
+
+### `draw()`
+
+
+
+```java
+private boolean draw(boolean fullRedrawNeeded) {
+        Surface surface = mSurface;
+        // surface无效则直接返回
+        if (!surface.isValid()) {
+            return false;
+        }
+    	.....
+        /**
+         * 开始从 DecorView 分发 draw
+         */
+        mAttachInfo.mTreeObserver.dispatchOnDraw();
+    	......
+
+        // 如果 脏区不为null 或者 正在执行动画 或者 无障碍服务发生变化
+        // 就开始 进行渲染 (硬件渲染 或者 软件渲染)
+        boolean useAsyncReport = false;
+        if (!dirty.isEmpty() || mIsAnimating || accessibilityFocusDirty) {
+            if (mAttachInfo.mThreadedRenderer != null && mAttachInfo.mThreadedRenderer.isEnabled()) {
+                ......
+                // 进行硬件绘制
+                mAttachInfo.mThreadedRenderer.draw(mView, mAttachInfo, this);
+            } else {
+                ......
+                // 调用 drawSoftware() 进行软件渲染
+                if (!drawSoftware(surface, mAttachInfo, xOffset, yOffset,
+                        scalingRequired, dirty, surfaceInsets)) {
+                    return false;
+                }
+            }
+        }
+        ......
+    }
+```
+
+
+
+## ThreadedRenderer
+
+### `draw()`
+
+* `updateRootDisplayList()` 从根部开始遍历整个View tree。
+* `registerAnimatingRenderNode()`  注册所有需要执行动画的RenderNode
+* `syncAndDrawFrame()` 调用native的同步绘制
+
+```java
+    void draw(View view, AttachInfo attachInfo, DrawCallbacks callbacks) {
+        final Choreographer choreographer = attachInfo.mViewRootImpl.mChoreographer;
+        choreographer.mFrameInfo.markDrawStart();
+		
+        // 从Decor开始遍历整个View Tree，更新硬件渲染中的脏区
+        updateRootDisplayList(view, callbacks);
+
+        // 注册每一个需要执行动画的RenderNode
+        if (attachInfo.mPendingAnimatingRenderNodes != null) {
+            final int count = attachInfo.mPendingAnimatingRenderNodes.size();
+            for (int i = 0; i < count; i++) {
+                registerAnimatingRenderNode(
+                        attachInfo.mPendingAnimatingRenderNodes.get(i));
+            }
+            attachInfo.mPendingAnimatingRenderNodes.clear();
+            // We don't need this anymore as subsequent calls to
+            // ViewRootImpl#attachRenderNodeAnimator will go directly to us.
+            attachInfo.mPendingAnimatingRenderNodes = null;
+        }
+		
+        // 调用native层的同步绘制
+        int syncResult = syncAndDrawFrame(choreographer.mFrameInfo);
+        if ((syncResult & SYNC_LOST_SURFACE_REWARD_IF_FOUND) != 0) {
+            Log.w("OpenGLRenderer", "Surface lost, forcing relayout");
+            // We lost our surface. For a relayout next frame which should give us a new
+            // surface from WindowManager, which hopefully will work.
+            attachInfo.mViewRootImpl.mForceNextWindowRelayout = true;
+            attachInfo.mViewRootImpl.requestLayout();
+        }
+        if ((syncResult & SYNC_REDRAW_REQUESTED) != 0) {
+            attachInfo.mViewRootImpl.invalidate();
+        }
+    }
+
+```
+
+
+
+### `updateRootDisplayList()`
+
+
+
+```java
+private void updateRootDisplayList(View view, DrawCallbacks callbacks) {
+    	// 1. 更新整个 ViewTree 
+        updateViewTreeDisplayList(view);
+
+        // Consume and set the frame callback after we dispatch draw to the view above, but before
+        // onPostDraw below which may reset the callback for the next frame.  This ensures that
+        // updates to the frame callback during scroll handling will also apply in this frame.
+        if (mNextRtFrameCallbacks != null) {
+            final ArrayList<FrameDrawingCallback> frameCallbacks = mNextRtFrameCallbacks;
+            mNextRtFrameCallbacks = null;
+            setFrameCallback(frame -> {
+                for (int i = 0; i < frameCallbacks.size(); ++i) {
+                    frameCallbacks.get(i).onFrameDraw(frame);
+                }
+            });
+        }
+
+        if (mRootNodeNeedsUpdate || !mRootNode.hasDisplayList()) {
+            // 2. 调用根绘制节点mRootNode的beginRecording方法，生成一个根DisplayListCanvas对象
+            RecordingCanvas canvas = mRootNode.beginRecording(mSurfaceWidth, mSurfaceHeight);
+            try {
+                final int saveCount = canvas.save();
+                canvas.translate(mInsetLeft, mInsetTop);
+                // 3. 调用ViewRootImpl的onPreDraw回调
+                callbacks.onPreDraw(canvas);
+
+                canvas.enableZ();
+                // 4. 绘制节点，并开始遍历子节点
+                canvas.drawRenderNode(view.updateDisplayListIfDirty());
+                canvas.disableZ();
+
+                // 5. 调用ViewRootImpl的onPostDraw回调
+                callbacks.onPostDraw(canvas);
+                canvas.restoreToCount(saveCount);
+                mRootNodeNeedsUpdate = false;
+            } finally {
+                // 6. 保存DisplayListCanvas到根节点中
+                mRootNode.endRecording();
+            }
+        }
+    }
+```
+
+
+
+### `updateViewTreeDisplayList()`
+
+
+
+```java
+	private void updateViewTreeDisplayList(View view) {
+        view.mPrivateFlags |= View.PFLAG_DRAWN;
+        view.mRecreateDisplayList = (view.mPrivateFlags & View.PFLAG_INVALIDATED)
+                == View.PFLAG_INVALIDATED;
+        view.mPrivateFlags &= ~View.PFLAG_INVALIDATED;
+        view.updateDisplayListIfDirty();
+        view.mRecreateDisplayList = false;
+    }
+```
+
+
+
+## View
+
+### `updateDisplayListIfDirty()`
+
+每个view更新硬件绘制中的脏区
+
+```java
+    public RenderNode updateDisplayListIfDirty() {
+        final RenderNode renderNode = mRenderNode;
+        if (!canHaveDisplayList()) {
+            // can't populate RenderNode, don't try
+            return renderNode;
+        }
+
+        if ((mPrivateFlags & PFLAG_DRAWING_CACHE_VALID) == 0
+                || !renderNode.hasDisplayList()
+                || (mRecreateDisplayList)) {
+            ......
+			
+            // 1. RenderNode.beginRecording() 生成一个 RecordingCanvas 
+            final RecordingCanvas canvas = renderNode.beginRecording(width, height);
+
+            try {
+                if (layerType == LAYER_TYPE_SOFTWARE) {
+                    // 软件绘制
+                    buildDrawingCache(true);
+                    Bitmap cache = getDrawingCache(true);
+                    if (cache != null) {
+                        canvas.drawBitmap(cache, 0, 0, mLayerPaint);
+                    }
+                } else {
+                    // 硬件绘制
+                    computeScroll();
+
+                    canvas.translate(-mScrollX, -mScrollY);
+                    mPrivateFlags |= PFLAG_DRAWN | PFLAG_DRAWING_CACHE_VALID;
+                    mPrivateFlags &= ~PFLAG_DIRTY_MASK;
+
+                    // Fast path for layouts with no backgrounds
+                    if ((mPrivateFlags & PFLAG_SKIP_DRAW) == PFLAG_SKIP_DRAW) {
+                        dispatchDraw(canvas);
+                        drawAutofilledHighlight(canvas);
+                        if (mOverlay != null && !mOverlay.isEmpty()) {
+                            mOverlay.getOverlayView().draw(canvas);
+                        }
+                        if (isShowingLayoutBounds()) {
+                            debugDrawFocus(canvas);
+                        }
+                    } else {
+                        // 2. 对DisplayListCanvas进行绘制
+                        draw(canvas);
+                    }
+                }
+            } finally {
+                // 3. RenderNode.endRecording() 保存 DisplayListCanvas 对象
+                renderNode.endRecording();
+                setDisplayListProperties(renderNode);
+            }
+        } else {
+            mPrivateFlags |= PFLAG_DRAWN | PFLAG_DRAWING_CACHE_VALID;
+            mPrivateFlags &= ~PFLAG_DIRTY_MASK;
+        }
+        return renderNode;
+    }
+
+```
 
 
 
